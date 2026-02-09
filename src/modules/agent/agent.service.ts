@@ -35,7 +35,7 @@ export class AgentService {
         this.memory = new BufferMemory({
             chatHistory: new RedisChatMessageHistory({
                 sessionId: 'default_session', // có thể dynamic theo userId
-                client: new ioredis(process.env.REDIS_URL || 'redis://localhost:6379'),
+                client: new ioredis(config.REDIS_URL),
             }),
         });
     }

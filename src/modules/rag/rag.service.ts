@@ -60,7 +60,8 @@ export class RagService {
   async retrieve(query: string) {
     try {
       const retriever = this.vectorStore.asRetriever({ k: 10, verbose: true }); // Debug verbose
-      const docs = await retriever.getRelevantDocuments(query);
+      // Newer LangChain retrievers expose `invoke` instead of `getRelevantDocuments`
+      const docs = await retriever.invoke(query);
       return docs
         .map((doc) => ({
           content: doc.pageContent,

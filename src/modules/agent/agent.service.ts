@@ -3,12 +3,8 @@ import { ChatOpenAI } from '@langchain/openai'; // <-- Thay đổi ở đây
 import { RagService } from '../rag/rag.service';
 import { McpClientHelper } from '../mcp/mcp.client';
 import { BufferMemory } from '@langchain/classic/memory';
-import { RedisChatMessageHistory } from '@langchain/redis'; // <-- Đây là package mới
-import ioredis from 'ioredis';
-import {
-    RunnableSequence,
-    RunnablePassthrough,
-} from '@langchain/core/runnables';
+import { RedisChatMessageHistory } from '@langchain/redis';
+import { createClient } from 'redis';
 import { StringOutputParser } from '@langchain/core/output_parsers';
 import { config } from '../../common/config';
 
@@ -16,7 +12,7 @@ import { config } from '../../common/config';
 export class AgentService {
     private readonly logger = new Logger(AgentService.name);
     private llm: ChatOpenAI;
-    private memory: BufferMemory;
+    private redisClient: ReturnType<typeof createClient> | null = null;
 
     constructor(
         private ragService: RagService,
@@ -30,20 +26,29 @@ export class AgentService {
             streaming: true, // Hỗ trợ stream response cho UX tốt hơn
             verbose: true, // Debug chain calls (rất hữu ích)
         });
+    }
 
-        // Memory scale với Redis (giữ nguyên)
-        this.memory = new BufferMemory({
-            chatHistory: new RedisChatMessageHistory({
-                sessionId: 'default_session', // có thể dynamic theo userId
-                client: new ioredis(config.REDIS_URL),
-            }),
-        });
+    private async getRedisClient() {
+        if (!this.redisClient) {
+            this.redisClient = createClient({ url: config.REDIS_URL });
+            await this.redisClient.connect();
+        }
+        return this.redisClient;
     }
 
     async handleQuery(query: string, sessionId: string): Promise<string> {
         try {
+
+            const client = await this.getRedisClient();
+            const memory = new BufferMemory({
+                chatHistory: new RedisChatMessageHistory({
+                    sessionId: sessionId || 'default_session',
+                    client,
+                }),
+            });
+
             // Load memory từ Redis
-            const history = await this.memory.loadMemoryVariables({});
+            const history = await memory.loadMemoryVariables({});
 
             // Bước 1: Reasoning để decide dùng RAG hay MCP (dùng LLM o3-mini mạnh reasoning)
             const reasoningPrompt = `
@@ -60,7 +65,19 @@ export class AgentService {
             `;
 
             const reasoningResponse = await this.llm.invoke(reasoningPrompt);
-            const plan = JSON.parse(reasoningResponse.content as string);
+            let rawPlan = reasoningResponse.content as string;
+
+            // Nếu LLM trả về JSON bọc trong ``` ``` thì bỏ wrapper trước khi parse
+            rawPlan = rawPlan.trim();
+            if (rawPlan.startsWith('```')) {
+                const firstNewline = rawPlan.indexOf('\n');
+                const lastFence = rawPlan.lastIndexOf('```');
+                if (firstNewline !== -1 && lastFence !== -1 && lastFence > firstNewline) {
+                    rawPlan = rawPlan.slice(firstNewline + 1, lastFence).trim();
+                }
+            }
+
+            const plan = JSON.parse(rawPlan);
 
             let ragContext = '';
             let mcpResult: any = null;
@@ -78,34 +95,31 @@ export class AgentService {
             }
 
             // Bước 3: Generate final answer với full context + memory
-            const finalChain = RunnableSequence.from([
-                RunnablePassthrough.assign({
-                    rag: () => ragContext,
-                    mcp: () => (mcpResult ? JSON.stringify(mcpResult) : 'Không dùng MCP'),
-                    history: () =>
-                        history.chatHistory
-                            ?.map((m) => `${m.role}: ${m.content}`)
-                            .join('\n') || '',
-                }),
-                this.llm,
-                new StringOutputParser(),
-            ]);
+            const historyText =
+                history.chatHistory
+                    ?.map((m) => `${m.role}: ${m.content}`)
+                    .join('\n') || '';
 
             const finalPrompt = `
-                Context từ RAG: {rag}
-                Kết quả MCP (nếu có): {mcp}
-                Lịch sử chat: {history}
+                Context từ RAG:
+                ${ragContext || 'Không dùng RAG'}
 
-                Trả lời query: "${query}"
-                - Chính xác, ngắn gọn, chuyên nghiệp.
-                - Trích dẫn nguồn nếu từ RAG.
-                - Không bịa thông tin.
+                Kết quả MCP (nếu có):
+                ${mcpResult ? JSON.stringify(mcpResult) : 'Không dùng MCP'}
+
+                Lịch sử chat:
+                ${historyText}
+
+                Trả lời query sau một cách chính xác, ngắn gọn, chuyên nghiệp,
+                trích dẫn nguồn nếu từ RAG và không bịa thông tin:
+                "${query}"
             `;
 
-            const response = await finalChain.invoke({});
+            const llmResult = await this.llm.invoke(finalPrompt);
+            const response = await new StringOutputParser().invoke(llmResult);
 
             // Lưu memory cho session tiếp theo
-            await this.memory.saveContext({ input: query }, { output: response });
+            await memory.saveContext({ input: query }, { output: response });
 
             return response;
         } catch (error) {
